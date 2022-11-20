@@ -1,5 +1,8 @@
+#!/home/ubuntu/anaconda3/envs/research/bin/python
 import gym
+import os
 import warnings
+import datetime as dt
 
 warnings.filterwarnings("ignore")
 import numpy as np
@@ -10,6 +13,8 @@ from torch.distributions import Categorical
 from torch.autograd import grad
 from torch.utils.tensorboard import SummaryWriter
 from common import SubprocVecEnv
+from argparse import ArgumentParser
+from tqdm import tqdm
 
 num_envs = 16
 env_name = "CartPole-v1"
@@ -33,10 +38,6 @@ env = gym.make(env_name, new_step_api=False)
 class ActorCritic(nn.Module):
     def __init__(self, num_inputs, num_outputs, hidden_size, std=0.0):
         super(ActorCritic, self).__init__()
-        print("Network configuration:")
-        print("input_dim:", num_inputs)
-        print("hidden_dim:", hidden_size)
-        print("output_dim:", num_outputs)
 
         self.critic = nn.Sequential(
             nn.Linear(num_inputs, hidden_size), nn.ReLU(), nn.Linear(hidden_size, 1)
@@ -59,12 +60,12 @@ class ActorCritic(nn.Module):
 class Hparams:
     num_inputs = envs.observation_space.shape[0]
     num_outputs = envs.action_space.n
-    hidden_size = 64
+    hidden_size = 32
     lr = 1e-3
     num_steps = 10
     max_frames = 20000
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    print(f"Network configuration: input_dim={num_inputs} hidden_units={hidden_size} output_dim={num_outputs}")
 
 def test_env(model, transform=None):
     if transform is None:
@@ -97,10 +98,13 @@ def compute_returns(next_value, rewards, masks, gamma=0.99):
 
 
 class LossObject:
-    def __init__(self, experiment):
+    def __init__(self, experiment_name, entropy_weight):
         self.reset()
         self.frame_idx = 0
-        self.writer = SummaryWriter(f"logs/{experiment}/")
+        date_part = dt.datetime.today().strftime("%Y-%m-%d")
+        self.writer = SummaryWriter(f"logs/{date_part}_{experiment_name}/")
+        self.entropy_weight = entropy_weight
+        self.progress_bar = tqdm(total=Hparams.max_frames, desc=experiment_name, unit='Frames')
 
     def reset(self):
         self.log_probs = []
@@ -135,7 +139,7 @@ class LossObject:
         actor_loss = -(log_probs * advantage.detach()).mean()
         critic_loss = advantage.pow(2).mean()
         grad_reg = grad_reg.mean()
-        loss_without_critic = actor_loss - 0.001 * self.entropy
+        loss_without_critic = actor_loss + self.entropy_weight * self.entropy
         loss = loss_without_critic + 0.5 * critic_loss + grad_reg
 
         # log actor loss, entropy and grad_reg
@@ -169,8 +173,22 @@ def model_env_forward(model, state, envs):
     return next_state, log_prob, value, reward, done, grad_reg_entropy, entropy
 
 
-def train_model(experiment):
+def model_ckpt(model, max_avg_reward, path, min_performance_to_save):
+    avg_reward = np.mean([test_env(model) for _ in range(500)])
+    if avg_reward > max_avg_reward:
+        # update max value
+        max_avg_reward = avg_reward
+        # save model
+        if max_avg_reward > min_performance_to_save:
+            torch.save(model, path)
+    return max_avg_reward, avg_reward
+
+
+def train_model(args, min_performance_to_save):
     transform = None
+    date_part = dt.datetime.today().strftime("%Y-%m-%d")
+    os.makedirs(f"model_saves/{date_part}/", exist_ok=True)
+    path = f"model_saves/{date_part}/{args.experiment_basename}.pth"
 
     # init model and optimizer
     model = ActorCritic(
@@ -179,12 +197,12 @@ def train_model(experiment):
         hidden_size=Hparams.hidden_size,
     ).to(Hparams.device)
 
-    optimizer = optim.Adam(lr=Hparams.lr, params=model.parameters())
+    optimizer = optim.Adam(lr=args.lr, params=model.parameters())
 
     # init env
     max_avg_reward = 0
     state = envs.reset()
-    loss_obj = LossObject(experiment)
+    loss_obj = LossObject(args.experiment_name, args.ew)
 
     while loss_obj.frame_idx < Hparams.max_frames:
         loss_obj.reset()
@@ -195,9 +213,10 @@ def train_model(experiment):
 
             if loss_obj.frame_idx % 500 == 0:
                 # average reward over 500 episodes
-                avg_reward = np.mean([test_env(model) for _ in range(500)])
-                max_avg_reward = max(max_avg_reward, avg_reward)
-                print(f"Frame={loss_obj.frame_idx} => avg_reward={avg_reward:.4f}")
+                max_avg_reward, avg_reward = model_ckpt(model, max_avg_reward, path, min_performance_to_save)
+                loss_obj.progress_bar.set_postfix(avg_reward=avg_reward, max_avg_reward=max_avg_reward)
+                loss_obj.progress_bar.update(500)
+                # print(f"Frame={loss_obj.frame_idx} => avg_reward={avg_reward:.4f}")
                 loss_obj.writer.add_scalar("avg_reward", avg_reward, loss_obj.frame_idx)
 
         state = torch.FloatTensor(state).to(Hparams.device)
@@ -207,11 +226,22 @@ def train_model(experiment):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+    loss_obj.progress_bar.close()
 
-    avg_reward = np.mean([test_env(model) for _ in range(500)])
-    max_avg_reward = max(max_avg_reward, avg_reward)
+    # post update, save model weights is performance improves
+    max_avg_reward, avg_reward = model_ckpt(model, max_avg_reward, path, min_performance_to_save)
+
     return max_avg_reward
 
+if __name__ == '__main__':
+    parser = ArgumentParser(prog="model trainer", description="trains cartpole actor")
+    parser.add_argument("experiment_basename", type=str)
+    parser.add_argument("lr", type=float, default=1e-3)
+    parser.add_argument("ew", type=float, default=0.0)
+    args = parser.parse_args()
 
-avg_reward = train_model("cartpole_v1_grad_reg")
-print(avg_reward)
+    avg_reward = 0
+    for run_num in range(5):
+        args.experiment_name = f"{args.experiment_basename}_{run_num+1}"
+        avg_reward = train_model(args, avg_reward)
+    print(avg_reward)

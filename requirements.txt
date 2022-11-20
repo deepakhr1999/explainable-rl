@@ -4,3 +4,4 @@ numpy==1.23.2
 torch==1.12.1
 black==22.6.0
 tensorboard==2.10.0
+tqdm==4.6.14
