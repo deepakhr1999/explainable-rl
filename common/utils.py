@@ -122,13 +122,6 @@ class LossObject:
 
     def update(self, log_prob, value, reward, done, grad_reg_entropy, entropy):
         if self.mode == "test":
-            # print(type(log_prob), "log_prob")
-            # print(type(value), "value")
-            # print(type(reward), "reward")
-            # print(type(done), "done")
-            # print(type(grad_reg_entropy), "grad_reg_entropy")
-            # print(type(entropy), "entropy")
-
             reward = np.array([reward])
             done = np.array([done])
 
@@ -156,8 +149,12 @@ class LossObject:
         actor_loss = -(log_probs * advantage.detach()).mean()
         critic_loss = advantage.pow(2).mean()
         grad_reg_mean = grad_reg.mean()
-        loss_without_critic = actor_loss + self.entropy_weight * self.entropy
-        loss = loss_without_critic + 0.5 * critic_loss + grad_reg_mean
+        loss_without_critic = actor_loss - 1e-3 * self.entropy
+        loss = (
+            loss_without_critic
+            + 0.5 * critic_loss
+            + self.entropy_weight * grad_reg_mean
+        )
 
         # log actor loss, entropy and grad_reg
         if self.mode == "train":
@@ -187,8 +184,9 @@ def model_env_forward(model, state, envs, mode="train"):
     log_prob = dist.log_prob(action)
 
     saliency = grad(probs[:, 0].sum(), state, retain_graph=True, create_graph=True)[0]
-    saliency = torch.softmax(1.0 * saliency**2, axis=1)
     if mode == "train":
+        saliency = saliency**2
+        saliency /= saliency.sum(1, keepdim=True)
         grad_reg_entropy = (
             -(saliency * torch.log(saliency)).sum(axis=1).mean(axis=0, keepdim=True)
         )
@@ -199,7 +197,8 @@ def model_env_forward(model, state, envs, mode="train"):
 
 
 def model_ckpt(model, max_avg_reward, path, min_performance_to_save):
-    avg_reward = np.mean([test_env(model) for _ in range(500)])
+    with torch.no_grad():
+        avg_reward = np.mean([test_env(model) for _ in range(50)])
     if avg_reward > max_avg_reward:
         # update max value
         max_avg_reward = avg_reward
@@ -236,16 +235,16 @@ def train_model(args, min_performance_to_save):
             state, *update_args = model_env_forward(model, state, envs)
             loss_obj.update(*update_args)
 
-            if loss_obj.frame_idx % 500 == 0:
+            if loss_obj.frame_idx % 250 == 0:
                 # average reward over 500 episodes
                 max_avg_reward, avg_reward = model_ckpt(
                     model, max_avg_reward, path, min_performance_to_save
                 )
                 loss_obj.progress_bar.set_postfix(
-                    avg_reward=avg_reward, max_avg_reward=max_avg_reward
+                    avg_reward=f"{avg_reward:.2f}",
+                    max_avg_reward=f"{max_avg_reward:.2f}",
                 )
-                loss_obj.progress_bar.update(500)
-                # print(f"Frame={loss_obj.frame_idx} => avg_reward={avg_reward:.4f}")
+                loss_obj.progress_bar.update(250)
                 loss_obj.writer.add_scalar("avg_reward", avg_reward, loss_obj.frame_idx)
 
         state = torch.FloatTensor(state).to(Hparams.device)
